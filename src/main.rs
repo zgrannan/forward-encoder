@@ -184,7 +184,7 @@ impl prusti_rustc_interface::driver::Callbacks for OurCompilerCalls {
                 ));
                 assert!(!body_with_facts.input_facts.cfg_edge.is_empty());
                 let body = &body_with_facts.body;
-                println!("{:?}", body);
+                // println!("{:?}", body);
                 run_forward(tcx, body);
             }
         });
@@ -212,6 +212,8 @@ fn main() {
 
     compiler_args.push("-Zpolonius".to_owned());
     compiler_args.push("-Zalways-encode-mir".to_owned());
+    compiler_args.push("-Zdump-mir=all".to_owned());
+    compiler_args.push("-Zdump-mir-dataflow".to_owned());
     compiler_args.push("-Zcrate-attr=feature(register_tool)".to_owned());
     compiler_args.push("-Zcrate-attr=register_tool(analyzer)".to_owned());
 
