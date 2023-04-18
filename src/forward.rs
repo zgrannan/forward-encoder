@@ -254,6 +254,7 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
             }
             StatementKind::StorageDead(_) => {},
             StatementKind::StorageLive(_) => {},
+            StatementKind::FakeRead(_) => {},
             other => { unimplemented!("{:?}", other) }
         }
     }

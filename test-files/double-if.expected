@@ -1,0 +1,13 @@
+Analyzing file test-files/double-if.rs
+Function double_if():
+Terminal block bb7: let _5 = _1 in
+let _4 = Gt(move _5, const 5_u32) in
+let _3 = if move _4 == Int(0) then const 2_u32 else const 1_u32 in
+let _8 = _2 in
+let _7 = Lt(move _8, const 6_u32) in
+let _6 = if move _7 == Int(0) then _3 else const 3_u32 in
+let _9 = _3 in
+let _10 = _6 in
+let _11 = CheckedAdd(_9, _10) in
+let _0 = move (_11.0: u32) in
+_0
