@@ -1,14 +1,6 @@
-// © 2022, ETH Zurich
-//
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
-//! A MIR interpreter that translates MIR into vir_poly expressions.
-//! 
-
 use prusti_rustc_interface::middle::{mir, ty};
 use mir::{BasicBlock, StatementKind, TerminatorKind};
+use std::fmt;
 use std::{fmt::Debug, iter::FromIterator, marker::Sized, collections::HashMap, collections::HashSet, process::Termination};
 use prusti_rustc_interface::dataflow::{
     Analysis, AnalysisDomain, CallReturnPlaces, 
@@ -30,6 +22,20 @@ pub enum MirExpr<'tcx> {
     Ite(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
     Eq(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
 } 
+
+impl<'tcx> fmt::Display for MirExpr<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MirExpr::Const(c) => write!(f, "{:?}", c),
+            MirExpr::Fail => write!(f, "fail"),
+            MirExpr::Local(l) => write!(f, "{:?}", l),
+            MirExpr::Rvalue(r) => write!(f, "{:?}", r),
+            MirExpr::Let(l, a, b) => write!(f, "let {:?} = {} in\n{}", l, a, b),
+            MirExpr::Ite(c, t, e) => write!(f, "if {} then {} else {}", c, t, e),
+            MirExpr::Eq(a, b) => write!(f, "{} == {}", a, b),
+        }
+    }
+}
 
 impl Eq for MirExpr<'_> {
 
@@ -120,6 +126,8 @@ struct State<'tcx> {
     // The set of all known branch conditions that lead into a basic block
     // We only use this to inheret parent branch conditions, since we can't access this directly 
     branch_conditions: HashMap<BasicBlock, BranchCond<'tcx>>,
+
+    unreachable_blocks: HashSet<BasicBlock>
 }
 
 impl <'tcx> State<'tcx> {
@@ -127,6 +135,7 @@ impl <'tcx> State<'tcx> {
         State {
             bindings: Vec::new(),
             branch_conditions: HashMap::new(),
+            unreachable_blocks: HashSet::new()
         }
     }
 
@@ -161,7 +170,8 @@ impl <'tcx> State<'tcx> {
     fn compute_expr(&self) -> MirExpr<'tcx> {
         assert!(self.bindings.len() == 1);
         let mut expr = MirExpr::Local(mir::Local::from_usize(0));
-        for binding in self.bindings.last().unwrap().1.0.iter() {
+        let bindings = self.peek_top_bindings();
+        for binding in bindings.1.0.iter().rev() {
             expr = MirExpr::Let(
                 binding.0,
                 box binding.1.clone(),
@@ -181,15 +191,17 @@ impl <'tcx> JoinSemiLattice for State<'tcx> {
         if self.is_bottom() {
             self.bindings = other.bindings.clone();
             self.branch_conditions = other.branch_conditions.clone();
+            self.unreachable_blocks = other.unreachable_blocks.clone();
             return true;
         }
         assert!(self.branch_condition().is_opposite(other.branch_condition()));
         let top_bindings = self.pop_top_bindings();
         let their_top_bindings = other.peek_top_bindings();
-        println!("Joining {:?} and {:?}", top_bindings, their_top_bindings);
+        // println!("Joining {:?} and {:?}", top_bindings, their_top_bindings);
         let new_top_bindings = 
             top_bindings.0.join_bindings(&top_bindings.1, &their_top_bindings.1);
         self.append_top_bindings(new_top_bindings);
+        self.unreachable_blocks.extend(other.unreachable_blocks.iter());
         true
     }
 }
@@ -236,7 +248,7 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
     ) {
         match &stmt.kind {
             StatementKind::Assign(box (lhs, rhs)) => {
-                println!("Add binding for: {:?}", stmt);
+                // println!("Add binding for: {:?}", stmt);
                 let lhs = lhs.as_local().unwrap();
                 state.push_binding((lhs, MirExpr::Rvalue(rhs.clone())));
             }
@@ -253,14 +265,10 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
     ) {
         match &terminator.kind {
             TerminatorKind::Assert { cond, expected, msg, target, cleanup } => {
-                // state.branch = Some((
-                //     MirExpr::Eq(
-                //         box MirExpr::Rvalue(mir::Rvalue::Use(cond.clone())),
-                //         box MirExpr::Const(Const::Bool(*expected)),
-                //     ),
-                //     *target,
-                //     *cleanup
-                // ));
+                match cleanup {
+                    Some(bb) => { state.unreachable_blocks.insert(bb.clone()); },
+                    _ => {}
+                }
             },
             TerminatorKind::Goto { target } => {
                 // state.branch = Some((
@@ -318,73 +326,10 @@ pub fn run_forward<'tcx>(
     for (bb, data) in mir.basic_blocks.iter_enumerated() {
         cursor.seek_to_block_end(bb);
         let results = cursor.get();
-        if data.terminator().successors().count() == 0 {
-            println!("{:?}", results.compute_expr());
+        if data.terminator().successors().count() == 0 && 
+           !results.unreachable_blocks.contains(&bb) {
+            println!("Terminal block {:?}: {}", bb, results.compute_expr());
         }
     }
     MirExpr::Local(mir::Local::from_usize(0))
 }
-
-// pub trait ExprFactory<'tcx, Expr, Var> {
-//     fn local(&self, local: mir::Local) -> SpannedEncodingResult<Var>;
-//     fn var(&self, v: Var) -> SpannedEncodingResult<Expr>;
-//     fn bin_op_expr(&self, op: mir::BinOp, left: Expr, right: Expr, ty: ty::Ty<'tcx>) -> EncodingResult<Expr>;
-//     fn operand_expr(&self, operand: &mir::Operand<'tcx>) -> EncodingResult<Expr>;
-//     fn let_expr(&self, binder: Var, value: Expr, body: Expr) -> Expr;
-//     fn switch_int(&self, cond: Expr, then_expr: Expr, else_expr: Expr) -> Expr;
-//     fn gt(&self, lhs: Expr, rhs:Expr) -> Expr;
-// }
-
-// fn interpret_rvalue<'tcx, F, Expr, Var>(
-//     operand_ty: ty::Ty<'tcx>, 
-//     rvalue: &mir::Rvalue<'tcx>, 
-//     interpreter: &F
-// ) -> EncodingResult<Expr> where F: ExprFactory<'tcx, Expr, Var> {
-//     match rvalue {
-//         &mir::Rvalue::BinaryOp(op, box (ref left, ref right)) => {
-//             let lhs = interpreter.operand_expr(left)?;
-//             let rhs = interpreter.operand_expr(right)?;
-//             interpreter.bin_op_expr(op, lhs, rhs, operand_ty)
-//         },
-//         &mir::Rvalue::CheckedBinaryOp(op, box (ref left, ref right)) => {
-//             let lhs = interpreter.operand_expr(left)?;
-//             let rhs = interpreter.operand_expr(right)?;
-//             interpreter.bin_op_expr(op, lhs, rhs, operand_ty)
-//         },
-//         other => { 
-//             unimplemented!("How to interpret {:?}", other) 
-//         }
-//     }
-// }
-
-// pub fn run_forward_interpreter<'tcx, F, Expr, Var>(
-//     mir: &mir::Body<'tcx>,
-//     interpreter: &F
-// ) -> SpannedEncodingResult<Expr> 
-// where 
-//     F: ExprFactory<'tcx, Expr, Var>,
-//     Expr: std::fmt::Debug + std::fmt::Display
-// {
-//     let mut cur_block = &mir.basic_blocks[mir::START_BLOCK];
-//     let mut assns: Vec<(Var, Expr)> = vec![];
-//     for stmt in cur_block.statements.iter() {
-//         match &stmt.kind {
-//             StatementKind::Assign(box (lhs, rhs)) => {
-//                 let lhs = lhs.as_local().unwrap();
-//                 let ty = mir.local_decls[lhs].ty;
-//                 let rhs_expr = interpret_rvalue(ty, rhs, interpreter)
-//                                 .map_err(|err| err.with_span(stmt.source_info.span))?;
-//                 let lhs = interpreter.local(lhs)?;
-//                 assns.push((lhs, rhs_expr));
-//             }
-//             _ => { unimplemented!() }
-//         }
-//     }
-//     let mut result: Expr = interpreter.var(
-//         interpreter.local(mir::RETURN_PLACE)?
-//     )?;
-//     for assn in assns {
-//         result = interpreter.let_expr(assn.0, assn.1, result)
-//     }
-//     Ok(result)
-// }

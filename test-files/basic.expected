@@ -1,0 +1,6 @@
+Analyzing file test-files/basic.rs
+Function foo():
+Terminal block bb3: let _3 = _1 in
+let _2 = Gt(move _3, const 2_u32) in
+let _0 = if move _2 == Int(0) then const 4_u32 else const 3_u32 in
+_0
