@@ -6,6 +6,7 @@ enum Thing {
     C(i32)
 }
 
+#[analyzer::run]
 fn go(thing: Thing) -> bool {
     match thing {
         Thing::A(x) => x == 7,

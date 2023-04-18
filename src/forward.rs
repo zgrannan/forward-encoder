@@ -12,7 +12,7 @@ struct PureForwardAnalysis;
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Const { Bool(bool), Int(u128) }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MirExpr<'tcx> {
     Const(Const),
     Fail,
@@ -21,8 +21,9 @@ pub enum MirExpr<'tcx> {
     Let(mir::Local, Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
     Ite(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
     Eq(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
+    NotEq(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
     And(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
-    Phi(Vec<(BranchCond<'tcx>, MirExpr<'tcx>)>),
+    Phi(Vec<(BranchConditions<'tcx>, MirExpr<'tcx>)>),
 } 
 
 impl<'tcx> MirExpr<'tcx> {
@@ -43,12 +44,10 @@ impl<'tcx> MirExpr<'tcx> {
                 )
             } else {
                 let mut phi = Vec::new();
-                for cond in branch_conditions.0.iter() {
-                    phi.push((cond.clone(), self.clone()));
-                }
-                for cond in other_branch_conditions.0.iter() {
-                    phi.push((cond.clone(), other.clone()));
-                }
+                phi.push(
+                    (disjoint.0, self.clone())
+                );
+                phi.push((disjoint.1, other.clone()));
                 return MirExpr::Phi(phi);
             }
         }
@@ -65,10 +64,11 @@ impl<'tcx> fmt::Display for MirExpr<'tcx> {
             MirExpr::Let(l, a, b) => write!(f, "let {:?} = {} in\n{}", l, a, b),
             MirExpr::Ite(c, t, e) => write!(f, "if {} then {} else {}", c, t, e),
             MirExpr::Eq(a, b) => write!(f, "{} == {}", a, b),
+            MirExpr::NotEq(a, b) => write!(f, "{} != {}", a, b),
             MirExpr::And(a, b) => write!(f, "{} && {}", a, b),
             MirExpr::Phi(pos) => { write!(f, "phi(")?;
                 for (cond, expr) in pos {
-                    write!(f, "{:?} => {}, ", cond, expr)?;
+                    write!(f, "{:?} => {},\n ", cond, expr)?;
                 }
                 write!(f, ")")
             }
@@ -191,16 +191,21 @@ impl <'tcx> BranchConditions <'tcx>{
     fn compute_disjoint(&self, other: &Self) -> DisjointConditions<'tcx> {
         let mut ours_missing = BranchConditions::new();
         let mut their_missing = BranchConditions::new();
+
         for ours in self.0.iter() {
             if !other.0.contains(ours) {
                 ours_missing.insert(ours.clone());
             }
         }
+
         for theirs in other.0.iter() {
             if !self.0.contains(theirs) {
                 their_missing.insert(theirs.clone());
             }
         }
+
+        eprintln!("Disjoint of: {:?} \nand{:?}\n", self, other);
+        eprintln!("is: {:?} and {:?}\n\n", ours_missing, their_missing);
 
         return DisjointConditions(ours_missing, their_missing);
     }
@@ -223,10 +228,11 @@ impl <'tcx> BranchCond<'tcx> {
                 Box::new(MirExpr::Rvalue(mir::Rvalue::Use(op.clone()))),
                 Box::new(MirExpr::Const(Const::Int(*v)))
             ),
-            BranchCond::Other(op, v) => MirExpr::Eq(
+            BranchCond::Other(op, v) if v.len() == 1 => MirExpr::NotEq(
                 Box::new(MirExpr::Rvalue(mir::Rvalue::Use(op.clone()))),
-                Box::new(MirExpr::Const(Const::Int(8888888)))
+                Box::new(MirExpr::Const(Const::Int(v.last().unwrap().clone())))
             ),
+            _ => unimplemented!()
 
         }
     }
@@ -326,16 +332,36 @@ impl <'tcx> AnalysisDomain<'tcx> for PureForwardAnalysis {
 }
 
 impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
+    fn apply_before_terminator_effect(
+        &self,
+        state: &mut Self::Domain,
+        terminator: &mir::Terminator<'tcx>,
+        location: mir::Location
+    ) {
+        if location.statement_index == 0 {
+            // eprintln!("Before terminator for no statements: {:?}", location.block);
+            if location.statement_index == 0 {
+                match state.branch_cond_to.get(&location.block) {
+                    Some(cond) => {
+                        // eprintln!("Inheriting branch condition: {:?}", cond);
+                        state.insert_branch_condition(cond.clone());
+                    },
+                    None => {}
+                }
+            }
+        }
+    }
     fn apply_before_statement_effect(
         &self,
         state: &mut Self::Domain,
         stmt: &mir::Statement<'tcx>,
         location: mir::Location
     ) {
+        // eprintln!("Before stmt: {:?}", location.block);
         if location.statement_index == 0 {
             match state.branch_cond_to.get(&location.block) {
                 Some(cond) => {
-                    eprintln!("Inheriting branch condition: {:?}", cond);
+                    // eprintln!("Inheriting branch condition: {:?}", cond);
                     state.insert_branch_condition(cond.clone());
                 },
                 None => {}
@@ -373,6 +399,12 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
                     _ => {}
                 }
             },
+            TerminatorKind::FalseEdge {real_target, imaginary_target} => {
+                state.unreachable_blocks.insert(imaginary_target.clone());
+            },
+            TerminatorKind::Unreachable {} => {
+                state.unreachable_blocks.insert(location.block); 
+            },
             TerminatorKind::Goto { target } => {
                 // state.branch = Some((
                 //     MirExpr::Const(Const::Bool(true)),
@@ -384,10 +416,9 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
 
             },
             TerminatorKind::SwitchInt { discr, targets } => {
-                eprintln!("SwitchInt: {:?}", discr);
-                assert!(targets.all_targets().len() == 2);
                 let mut non_values = vec![];
                 for (value, bb) in targets.iter() {
+                    eprintln!("SwitchInt: {:?} = {:?} -> {:?}", discr, value, bb);
                     non_values.push(value);
                     state.branch_cond_to.insert(
                         bb, 
