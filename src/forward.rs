@@ -44,11 +44,20 @@ impl<'tcx> MirExpr<'tcx> {
                 )
             } else {
                 let mut phi = Vec::new();
-                phi.push(
-                    (disjoint.0, self.clone())
-                );
+                match self {
+                    MirExpr::Phi(self_phi) => {
+                        phi.extend(self_phi.clone());
+                    },
+                    _ => {
+                        phi.push(
+                            (disjoint.0, self.clone())
+                        );
+                    }
+                };
                 phi.push((disjoint.1, other.clone()));
-                return MirExpr::Phi(phi);
+                let result = MirExpr::Phi(phi);
+                eprintln!("{}", result);
+                result
             }
         }
     }
@@ -123,9 +132,13 @@ impl <'tcx> Bindings<'tcx> {
 }
 
 #[derive(Clone, PartialEq, Debug)]
+// Disjunction of conditions leading to a basic block.
 struct BranchConditions<'tcx>(HashSet<BranchCond<'tcx>>);
 
 impl <'tcx> BranchConditions<'tcx> {
+    fn implies(&self, other: &BranchConditions<'tcx>) -> bool {
+        self.0.is_subset(&other.0)
+    }
     fn expr(&self) -> MirExpr<'tcx> {
         let mut it = self.conditions();
         let mut result = match it.next() {
@@ -204,7 +217,7 @@ impl <'tcx> BranchConditions <'tcx>{
             }
         }
 
-        eprintln!("Disjoint of: {:?} \nand{:?}\n", self, other);
+        eprintln!("Disjoint of: {:?} \nand {:?}\n", self, other);
         eprintln!("is: {:?} and {:?}\n\n", ours_missing, their_missing);
 
         return DisjointConditions(ours_missing, their_missing);
@@ -250,6 +263,11 @@ impl <'tcx> Eq for BranchCond<'tcx> {
 
 #[derive(Clone, PartialEq, Debug)]
 struct State<'tcx> {
+
+    imaginary_edges: HashSet<(BasicBlock, BasicBlock)>,
+    incoming_data: Vec<(BasicBlock, Box<State<'tcx>>)>,
+    block: Option<BasicBlock>,
+
     bindings: Bindings<'tcx>,
     branch_conditions: BranchConditions<'tcx>,
 
@@ -267,6 +285,10 @@ impl <'tcx> Eq for State<'tcx> {
 impl <'tcx> State<'tcx> {
     fn new() -> Self {
         State {
+            imaginary_edges: HashSet::new(),
+            incoming_data: Vec::new(),
+            block: None,
+
             bindings: Bindings::new(),
             branch_conditions: BranchConditions::new(),
             branch_cond_to: HashMap::new(),
@@ -294,6 +316,33 @@ impl <'tcx> State<'tcx> {
         }
         expr
     }
+
+    fn apply_first(&mut self, location: mir::Location) {
+        if location.statement_index == 0 {
+            assert!(self.block.is_none());
+            self.block = Some(location.block);
+            for (block, other) in self.incoming_data.iter() {
+                if !self.imaginary_edges.contains(&(*block, location.block)) {
+                    eprintln!("Merge {:?} into {:?}", block, location.block);
+                    self.bindings.merge(
+                        &other.bindings, 
+                        &self.branch_conditions, 
+                        &other.branch_conditions
+                    );
+                    self.branch_conditions.merge(&other.branch_conditions);
+                }
+
+            }
+            match self.branch_cond_to.get(&location.block) {
+                Some(cond) => {
+                    // eprintln!("Inheriting branch condition: {:?}", cond);
+                    self.insert_branch_condition(cond.clone());
+                },
+                None => {}
+            }
+        }
+    }
+
 }
 
 impl <'tcx, C> DebugWithContext<C> for State<'tcx> {
@@ -302,14 +351,15 @@ impl <'tcx, C> DebugWithContext<C> for State<'tcx> {
 
 impl <'tcx> JoinSemiLattice for State<'tcx> {
     fn join(&mut self, other: &Self) -> bool {
-        self.bindings.merge(
-            &other.bindings, 
-            &self.branch_conditions, 
-            &other.branch_conditions
-        );
-        self.branch_conditions.merge(&other.branch_conditions);
-        self.unreachable_blocks.extend(other.unreachable_blocks.iter());
+
+        self.imaginary_edges.extend(other.imaginary_edges.iter());
         self.branch_cond_to.extend(other.branch_cond_to.clone().into_iter());
+        self.unreachable_blocks.extend(other.unreachable_blocks.iter());
+
+        self.incoming_data.push(
+            (other.block.unwrap(), box other.clone())
+        );
+
         true
     }
 }
@@ -335,44 +385,24 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
     fn apply_before_terminator_effect(
         &self,
         state: &mut Self::Domain,
-        terminator: &mir::Terminator<'tcx>,
+        _terminator: &mir::Terminator<'tcx>,
         location: mir::Location
     ) {
-        if location.statement_index == 0 {
-            // eprintln!("Before terminator for no statements: {:?}", location.block);
-            if location.statement_index == 0 {
-                match state.branch_cond_to.get(&location.block) {
-                    Some(cond) => {
-                        // eprintln!("Inheriting branch condition: {:?}", cond);
-                        state.insert_branch_condition(cond.clone());
-                    },
-                    None => {}
-                }
-            }
-        }
+        state.apply_first(location);
     }
     fn apply_before_statement_effect(
         &self,
         state: &mut Self::Domain,
-        stmt: &mir::Statement<'tcx>,
+        _stmt: &mir::Statement<'tcx>,
         location: mir::Location
     ) {
-        // eprintln!("Before stmt: {:?}", location.block);
-        if location.statement_index == 0 {
-            match state.branch_cond_to.get(&location.block) {
-                Some(cond) => {
-                    // eprintln!("Inheriting branch condition: {:?}", cond);
-                    state.insert_branch_condition(cond.clone());
-                },
-                None => {}
-            }
-        }
+        state.apply_first(location);
     }
     fn apply_statement_effect(
         &self,
         state: &mut Self::Domain,
         stmt: &mir::Statement<'tcx>,
-        location: mir::Location
+        _location: mir::Location
     ) {
         match &stmt.kind {
             StatementKind::Assign(box (lhs, rhs)) => {
@@ -400,7 +430,8 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
                 }
             },
             TerminatorKind::FalseEdge {real_target, imaginary_target} => {
-                state.unreachable_blocks.insert(imaginary_target.clone());
+                state.imaginary_edges.insert((state.block.unwrap(), imaginary_target.clone()));
+
             },
             TerminatorKind::Unreachable {} => {
                 state.unreachable_blocks.insert(location.block); 
