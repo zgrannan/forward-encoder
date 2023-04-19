@@ -1,7 +1,7 @@
 use prusti_rustc_interface::middle::{mir, ty};
 use mir::{BasicBlock, StatementKind, TerminatorKind};
 use std::fmt;
-use std::{fmt::Debug, iter::FromIterator, marker::Sized, collections::HashMap, collections::HashSet, process::Termination};
+use std::{fmt::Debug, collections::HashMap, collections::HashSet};
 use prusti_rustc_interface::dataflow::{
     Analysis, AnalysisDomain, CallReturnPlaces, 
     Engine, JoinSemiLattice, fmt::DebugWithContext
@@ -12,6 +12,10 @@ use crate::ssa::*;
 struct PureForwardAnalysis(SsaAnalysis);
 
 impl PureForwardAnalysis {
+
+    fn get_ssa_version(&self, location: mir::Location, local: mir::Local) -> usize {
+        self.0.version.get(&(location, local)).unwrap().clone()
+    }
 
     fn apply_first(&self, state: &mut State, location: mir::Location) {
         if location.statement_index == 0 {
@@ -54,7 +58,6 @@ impl PureForwardAnalysis {
 impl<'tcx> fmt::Display for MirExpr<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MirExpr::Const(c) => write!(f, "{:?}", c),
             MirExpr::Fail => write!(f, "fail"),
             MirExpr::BoundVar(l) => write!(f, "{:?}", l),
             MirExpr::Rvalue(r) => write!(f, "{:?}", r),
@@ -64,7 +67,7 @@ impl<'tcx> fmt::Display for MirExpr<'tcx> {
             MirExpr::NotEq(a, b) => write!(f, "{} != {}", a, b),
             MirExpr::And(a, b) => write!(f, "{} && {}", a, b),
             MirExpr::Or(a, b) => write!(f, "{} || {}", a, b),
-            MirExpr::Phi(pos) => { write!(f, "phi(")?;
+            MirExpr::Phi(pos) => { write!(f, "phi(\n ")?;
                 for (cond, expr) in pos {
                     write!(f, "{:?} => {},\n ", cond, expr)?;
                 }
@@ -88,6 +91,34 @@ impl <'tcx> Bindings<'tcx> {
     fn new() -> Self {
         Bindings(vec![])
     }
+
+    // TODO
+    // fn subst_expr(&self, expr: MirExpr<'tcx>) -> MirExpr<'tcx> {
+    //     match expr {
+    //         MirExpr::Phi(vec) => {
+    //             let mut expr = MirExpr::Fail;
+    //             for (cond, rhs) in vec.iter() {
+    //                 let cond_expr = cond.expr();
+    //                 expr = MirExpr::Ite(
+    //                     box self.subst_expr(cond_expr), 
+    //                     box self.subst_expr(rhs.clone()), 
+    //                     box expr
+    //                 );
+    //             }
+    //             expr
+    //         },
+    //         MirExpr::Eq(a, b) => MirExpr::Eq(
+    //             box self.subst_expr(*a), 
+    //             box self.subst_expr(*b)
+    //         ),
+    //         MirExpr::Operand(o) => {
+    //             match o {
+    //                 Operand::Place()
+    //             }
+    //         }
+    //         _ => unimplemented!()
+    //     }
+    // }
 
     fn lookup(&self, var: BindVar) -> Option<MirExpr<'tcx>> {
         self.0.iter().find(|b| b.0 == var).map(|b| b.1.clone())
@@ -213,6 +244,7 @@ impl <'tcx> AnalysisDomain<'tcx> for PureForwardAnalysis {
             body: &mir::Body<'tcx>,
             state: &mut Self::Domain
     ) { 
+        state.path_conditions = PathConditions::no_conditions();
     }
 }
 
@@ -243,9 +275,15 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
             StatementKind::Assign(box (lhs, rhs)) => {
                 // println!("Add binding for: {:?}", stmt);
                 let lhs = lhs.as_local().unwrap();
-                let ssa_version = self.0.version.get(&(location, lhs)).unwrap();
+                let ssa_version = self.get_ssa_version(location, lhs);
                 println!("SSAVersion {:?} {:?}: {}", location, lhs, ssa_version);
-                state.insert_binding((BindVar(lhs, *ssa_version), MirExpr::Rvalue(rhs.clone())));
+                let rhs = MirExpr::Rvalue(
+                    Rvalue::from_mir(
+                        rhs,
+                        &|local| self.get_ssa_version(location, local)
+                    )
+                );
+                state.insert_binding((BindVar(lhs, ssa_version), rhs));
             }
             StatementKind::StorageDead(_) => {},
             StatementKind::StorageLive(_) => {},
@@ -284,18 +322,22 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
 
             },
             TerminatorKind::SwitchInt { discr, targets } => {
+                let mir_place = discr.place().unwrap();
+                let place = Place::from_mir(mir_place, |local| {
+                    self.0.version.get(&(location, local)).unwrap().clone()
+                });
                 let mut non_values = vec![];
                 for (value, bb) in targets.iter() {
                     eprintln!("SwitchInt: {:?} = {:?} -> {:?}", discr, value, bb);
                     non_values.push(value);
                     state.branch_cond_to.insert(
                         bb, 
-                        BranchCond::Equals(discr.clone(), value)
+                        BranchCond::Equals(place.clone(), value)
                     );
                 }
                 state.branch_cond_to.insert(
                     targets.otherwise(),
-                    BranchCond::Other(discr.clone(), non_values)
+                    BranchCond::Other(place.clone(), non_values)
                 );
             }
             other => { unimplemented!("{:?}", other) }
@@ -333,7 +375,6 @@ pub fn run_forward<'tcx>(
            !results.unreachable_blocks.contains(&bb) {
             let result = results.compute_expr(4);
             println!("Terminal block {:?}: {}", bb, result);
-            println!("{:?}", results.bindings);
             return result;
         }
     }
