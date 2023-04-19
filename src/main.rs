@@ -2,7 +2,9 @@
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 
+mod expr;
 mod forward;
+mod ssa;
 
 use std::{cell::RefCell, rc::Rc};
 use prusti_rustc_interface::{

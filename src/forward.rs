@@ -6,75 +6,64 @@ use prusti_rustc_interface::dataflow::{
     Analysis, AnalysisDomain, CallReturnPlaces, 
     Engine, JoinSemiLattice, fmt::DebugWithContext
 };
+use crate::expr::*;
+use crate::ssa::*;
 
-struct PureForwardAnalysis;
+struct PureForwardAnalysis(SsaAnalysis);
 
-#[derive(Debug, Clone, PartialEq, Hash)]
-pub enum Const { Bool(bool), Int(u128) }
+impl PureForwardAnalysis {
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum MirExpr<'tcx> {
-    Const(Const),
-    Fail,
-    Local(mir::Local),
-    Rvalue(mir::Rvalue<'tcx>),
-    Let(mir::Local, Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
-    Ite(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
-    Eq(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
-    NotEq(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
-    And(Box<MirExpr<'tcx>>, Box<MirExpr<'tcx>>),
-    Phi(Vec<(BranchConditions<'tcx>, MirExpr<'tcx>)>),
-} 
-
-impl<'tcx> MirExpr<'tcx> {
-    fn join (&self, 
-        other: &MirExpr<'tcx>, 
-        branch_conditions: &BranchConditions<'tcx>, 
-        other_branch_conditions: &BranchConditions<'tcx>
-    ) -> MirExpr<'tcx> {
-        if self == other {
-            return self.clone();
-        } else {
-            let disjoint = branch_conditions.compute_disjoint(other_branch_conditions);
-            if disjoint.covers_all_cases() {
-                MirExpr::Ite(
-                    Box::new(disjoint.left_condition()),
-                    Box::new(self.clone()),
-                    Box::new(other.clone())
-                )
-            } else {
-                let mut phi = Vec::new();
-                match self {
-                    MirExpr::Phi(self_phi) => {
-                        phi.extend(self_phi.clone());
-                    },
-                    _ => {
-                        phi.push(
-                            (disjoint.0, self.clone())
-                        );
-                    }
-                };
-                phi.push((disjoint.1, other.clone()));
-                let result = MirExpr::Phi(phi);
-                eprintln!("{}", result);
-                result
+    fn apply_first(&self, state: &mut State, location: mir::Location) {
+        if location.statement_index == 0 {
+            assert!(state.block.is_none());
+            state.block = Some(location.block);
+            for (block, other) in state.incoming_data.iter() {
+                if !state.imaginary_edges.contains(&(*block, location.block)) {
+                    eprintln!("Merge {:?} into {:?}", block, location.block);
+                    state.path_conditions.merge(&other.path_conditions);
+                    state.bindings.merge(&other.bindings);
+                }
+            }
+            for phi in self.0.phi.get(&location.block).unwrap_or(&vec![]).iter() {
+                eprintln!("PHI: {phi:?}");
+                let new_var = BindVar(phi.local, phi.new_version);
+                if(state.bindings.contains(new_var)){
+                    continue;
+                }
+                let mut phi_parts = vec![];
+                for (block, version) in phi.sources.iter() {
+                    let incoming_path_conditions = state.incoming_data.get(block).unwrap().path_conditions.clone();
+                    phi_parts.push((
+                        incoming_path_conditions,
+                        MirExpr::BoundVar(BindVar(phi.local, *version))
+                    ));
+                }
+                state.bindings.insert((new_var, MirExpr::Phi(phi_parts)));
+            }
+            match state.branch_cond_to.get(&location.block) {
+                Some(cond) => {
+                    // eprintln!("Inheriting branch condition: {:?}", cond);
+                    state.insert_branch_condition(cond.clone());
+                },
+                None => {}
             }
         }
     }
-}
 
+}
 impl<'tcx> fmt::Display for MirExpr<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MirExpr::Const(c) => write!(f, "{:?}", c),
             MirExpr::Fail => write!(f, "fail"),
-            MirExpr::Local(l) => write!(f, "{:?}", l),
+            MirExpr::BoundVar(l) => write!(f, "{:?}", l),
             MirExpr::Rvalue(r) => write!(f, "{:?}", r),
             MirExpr::Let(l, a, b) => write!(f, "let {:?} = {} in\n{}", l, a, b),
             MirExpr::Ite(c, t, e) => write!(f, "if {} then {} else {}", c, t, e),
             MirExpr::Eq(a, b) => write!(f, "{} == {}", a, b),
             MirExpr::NotEq(a, b) => write!(f, "{} != {}", a, b),
             MirExpr::And(a, b) => write!(f, "{} && {}", a, b),
+            MirExpr::Or(a, b) => write!(f, "{} || {}", a, b),
             MirExpr::Phi(pos) => { write!(f, "phi(")?;
                 for (cond, expr) in pos {
                     write!(f, "{:?} => {},\n ", cond, expr)?;
@@ -89,187 +78,56 @@ impl Eq for MirExpr<'_> {
 
 }
 
-type Binding<'tcx> = (mir::Local, MirExpr<'tcx>);
+type Binding<'tcx> = (BindVar, MirExpr<'tcx>);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Bindings<'tcx>(Vec<Binding<'tcx>>);
+
 
 impl <'tcx> Bindings<'tcx> {
     fn new() -> Self {
         Bindings(vec![])
     }
 
-    fn lookup(&self, local: mir::Local) -> Option<MirExpr<'tcx>> {
-        self.0.iter().find(|b| b.0 == local).map(|b| b.1.clone())
+    fn lookup(&self, var: BindVar) -> Option<MirExpr<'tcx>> {
+        self.0.iter().find(|b| b.0 == var).map(|b| b.1.clone())
     }
-
-    fn update(&mut self, local: mir::Local, expr: MirExpr<'tcx>) {
-        self.0.iter_mut().find(|b| b.0 == local).map(|b| b.1 = expr);
+    fn contains(&self, var: BindVar) -> bool {
+        self.lookup(var).is_some()
     }
-
 
     fn insert(&mut self, binding: Binding<'tcx>) {
-        assert!(self.lookup(binding.0).is_none());
+        assert!(
+            self.lookup(binding.0).is_none(),
+            "Cannot insert {:?}: Binding already exists: {:?}",
+            binding,
+            self.lookup(binding.0).unwrap(),
+        );
         self.0.push(binding);
     }
 
 
     fn merge(&mut self, 
         other_bindings: &Bindings<'tcx>,
-        branch_conditions: &BranchConditions<'tcx>,
-        other_branch_conditions: &BranchConditions<'tcx>
     ) {
         for binding in other_bindings.0.iter() {
-            match self.lookup(binding.0) {
-                Some(our_expr) => { 
-                    let joined_expr = our_expr.join(&binding.1, branch_conditions, other_branch_conditions);
-                    self.update(binding.0, joined_expr);
-                },
-                None => self.insert(binding.clone()),
+            if self.lookup(binding.0).is_none() {
+                self.insert(binding.clone());
             }
         }
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
-// Disjunction of conditions leading to a basic block.
-struct BranchConditions<'tcx>(HashSet<BranchCond<'tcx>>);
-
-impl <'tcx> BranchConditions<'tcx> {
-    fn implies(&self, other: &BranchConditions<'tcx>) -> bool {
-        self.0.is_subset(&other.0)
-    }
-    fn expr(&self) -> MirExpr<'tcx> {
-        let mut it = self.conditions();
-        let mut result = match it.next() {
-            Some(e) => e.expr(),
-            None => return MirExpr::Const(Const::Bool(true))
-        };
-        while let Some(e) = it.next() {
-            result = MirExpr::And(Box::new(result), Box::new(e.expr()));
-        }
-        return result;
-    }
-    fn conditions(&self) -> impl Iterator<Item = &BranchCond<'tcx>> {
-        self.0.iter()
-    }
-    fn operands(&self) -> impl Iterator<Item = &mir::Operand<'tcx>> {
-        self.0.iter().map(|c| c.get_operand())
-    }
-}
-
-#[derive(Clone, PartialEq, Debug)]
-struct DisjointConditions<'tcx>(BranchConditions<'tcx>, BranchConditions<'tcx>);
-
-impl <'tcx> DisjointConditions<'tcx> {
-    fn all_conditions(&self) -> impl Iterator<Item = BranchCond<'tcx>> {
-        let mut base = self.0.0.clone();
-        base.extend(self.1.0.clone().into_iter());
-        base.into_iter()
-    }
-
-    fn left_condition(&self) -> MirExpr<'tcx> {
-        self.0.expr()
-    }
-
-    fn covers_all_cases(&self) -> bool {
-        let base_operand = self.0.operands().next().unwrap();
-        if(self.all_conditions().all(|e| e.get_operand() == base_operand)) {
-            let mut seen_values: HashSet<u128> = HashSet::new();
-            let mut other: Option<HashSet<u128>> = None;
-            for condition in self.all_conditions() {
-                match condition {
-                    BranchCond::Equals(_, v) => { seen_values.insert(v); },
-                    BranchCond::Other(_, v) => other = Some(
-                        HashSet::from_iter(v.into_iter())
-                    )
-                }
-            }
-            other == Some(seen_values)
-        } else {
-            false
-        }
-    }
-}
-
-impl <'tcx> BranchConditions <'tcx>{
-    fn new() -> Self {
-        BranchConditions(HashSet::new())
-    }
-
-    fn merge(&mut self, other: &Self) {
-        self.0.extend(other.0.clone().into_iter());
-    }
-
-    fn compute_disjoint(&self, other: &Self) -> DisjointConditions<'tcx> {
-        let mut ours_missing = BranchConditions::new();
-        let mut their_missing = BranchConditions::new();
-
-        for ours in self.0.iter() {
-            if !other.0.contains(ours) {
-                ours_missing.insert(ours.clone());
-            }
-        }
-
-        for theirs in other.0.iter() {
-            if !self.0.contains(theirs) {
-                their_missing.insert(theirs.clone());
-            }
-        }
-
-        eprintln!("Disjoint of: {:?} \nand {:?}\n", self, other);
-        eprintln!("is: {:?} and {:?}\n\n", ours_missing, their_missing);
-
-        return DisjointConditions(ours_missing, their_missing);
-    }
-
-    fn insert(&mut self, cond: BranchCond<'tcx>) {
-        self.0.insert(cond);
-    }
-}
-
-#[derive(Clone, PartialEq, Debug, Hash)]
-enum BranchCond<'tcx> {
-    Equals(mir::Operand<'tcx>, u128),
-    Other(mir::Operand<'tcx>, Vec<u128>),
-}
-
-impl <'tcx> BranchCond<'tcx> {
-    fn expr(&self) -> MirExpr<'tcx> {
-        match self {
-            BranchCond::Equals(op, v) => MirExpr::Eq(
-                Box::new(MirExpr::Rvalue(mir::Rvalue::Use(op.clone()))),
-                Box::new(MirExpr::Const(Const::Int(*v)))
-            ),
-            BranchCond::Other(op, v) if v.len() == 1 => MirExpr::NotEq(
-                Box::new(MirExpr::Rvalue(mir::Rvalue::Use(op.clone()))),
-                Box::new(MirExpr::Const(Const::Int(v.last().unwrap().clone())))
-            ),
-            _ => unimplemented!()
-
-        }
-    }
-    fn get_operand(&self) -> &mir::Operand<'tcx> {
-        match self {
-            BranchCond::Equals(op, _) => op,
-            BranchCond::Other(op, _) => op,
-        }
-    }
-}
-
-impl <'tcx> Eq for BranchCond<'tcx> {
-
-}
 
 #[derive(Clone, PartialEq, Debug)]
 struct State<'tcx> {
 
     imaginary_edges: HashSet<(BasicBlock, BasicBlock)>,
-    incoming_data: Vec<(BasicBlock, Box<State<'tcx>>)>,
+    incoming_data: HashMap<BasicBlock, State<'tcx>>,
     block: Option<BasicBlock>,
 
     bindings: Bindings<'tcx>,
-    branch_conditions: BranchConditions<'tcx>,
+    path_conditions: PathConditions<'tcx>,
 
     // The set of all known branch conditions that lead into a basic block
     // We only use this to inherit parent branch conditions, since we can't access this directly 
@@ -286,11 +144,11 @@ impl <'tcx> State<'tcx> {
     fn new() -> Self {
         State {
             imaginary_edges: HashSet::new(),
-            incoming_data: Vec::new(),
+            incoming_data: HashMap::new(),
             block: None,
 
             bindings: Bindings::new(),
-            branch_conditions: BranchConditions::new(),
+            path_conditions: PathConditions::unreachable(),
             branch_cond_to: HashMap::new(),
             unreachable_blocks: HashSet::new(),
         }
@@ -301,11 +159,13 @@ impl <'tcx> State<'tcx> {
     }
 
     fn insert_branch_condition(&mut self, cond: BranchCond<'tcx>) {
-        self.branch_conditions.insert(cond);
+        self.path_conditions.conjoin_branch_cond(cond);
     }
 
-    fn compute_expr(&self) -> MirExpr<'tcx> {
-        let mut expr = MirExpr::Local(mir::Local::from_usize(0));
+    fn compute_expr(&self, version: usize) -> MirExpr<'tcx> {
+        let mut expr = MirExpr::BoundVar(
+            BindVar(mir::Local::from_usize(0), version)
+        );
         let bindings = &self.bindings;
         for binding in bindings.0.iter().rev() {
             expr = MirExpr::Let(
@@ -317,31 +177,6 @@ impl <'tcx> State<'tcx> {
         expr
     }
 
-    fn apply_first(&mut self, location: mir::Location) {
-        if location.statement_index == 0 {
-            assert!(self.block.is_none());
-            self.block = Some(location.block);
-            for (block, other) in self.incoming_data.iter() {
-                if !self.imaginary_edges.contains(&(*block, location.block)) {
-                    eprintln!("Merge {:?} into {:?}", block, location.block);
-                    self.bindings.merge(
-                        &other.bindings, 
-                        &self.branch_conditions, 
-                        &other.branch_conditions
-                    );
-                    self.branch_conditions.merge(&other.branch_conditions);
-                }
-
-            }
-            match self.branch_cond_to.get(&location.block) {
-                Some(cond) => {
-                    // eprintln!("Inheriting branch condition: {:?}", cond);
-                    self.insert_branch_condition(cond.clone());
-                },
-                None => {}
-            }
-        }
-    }
 
 }
 
@@ -356,8 +191,8 @@ impl <'tcx> JoinSemiLattice for State<'tcx> {
         self.branch_cond_to.extend(other.branch_cond_to.clone().into_iter());
         self.unreachable_blocks.extend(other.unreachable_blocks.iter());
 
-        self.incoming_data.push(
-            (other.block.unwrap(), box other.clone())
+        self.incoming_data.insert(
+            other.block.unwrap(), other.clone()
         );
 
         true
@@ -388,7 +223,7 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
         _terminator: &mir::Terminator<'tcx>,
         location: mir::Location
     ) {
-        state.apply_first(location);
+        self.apply_first(state, location);
     }
     fn apply_before_statement_effect(
         &self,
@@ -396,19 +231,21 @@ impl <'tcx> Analysis<'tcx> for PureForwardAnalysis {
         _stmt: &mir::Statement<'tcx>,
         location: mir::Location
     ) {
-        state.apply_first(location);
+        self.apply_first(state, location);
     }
     fn apply_statement_effect(
         &self,
         state: &mut Self::Domain,
         stmt: &mir::Statement<'tcx>,
-        _location: mir::Location
+        location: mir::Location
     ) {
         match &stmt.kind {
             StatementKind::Assign(box (lhs, rhs)) => {
                 // println!("Add binding for: {:?}", stmt);
                 let lhs = lhs.as_local().unwrap();
-                state.insert_binding((lhs, MirExpr::Rvalue(rhs.clone())));
+                let ssa_version = self.0.version.get(&(location, lhs)).unwrap();
+                println!("SSAVersion {:?} {:?}: {}", location, lhs, ssa_version);
+                state.insert_binding((BindVar(lhs, *ssa_version), MirExpr::Rvalue(rhs.clone())));
             }
             StatementKind::StorageDead(_) => {},
             StatementKind::StorageLive(_) => {},
@@ -479,7 +316,9 @@ pub fn run_forward<'tcx>(
     tcx: ty::TyCtxt<'tcx>,
     mir: &mir::Body<'tcx>
 ) -> MirExpr<'tcx> {
-    let analysis = PureForwardAnalysis;
+    let mut ssa = SsaVisitor::new(mir.local_decls.len());
+    ssa.analyse(mir);
+    let analysis = PureForwardAnalysis(ssa.analysis);
     let engine = Engine::new_generic(
         tcx,
         mir,
@@ -492,8 +331,11 @@ pub fn run_forward<'tcx>(
         let results = cursor.get();
         if data.terminator().successors().count() == 0 && 
            !results.unreachable_blocks.contains(&bb) {
-            println!("Terminal block {:?}: {}", bb, results.compute_expr());
+            let result = results.compute_expr(4);
+            println!("Terminal block {:?}: {}", bb, result);
+            println!("{:?}", results.bindings);
+            return result;
         }
     }
-    MirExpr::Local(mir::Local::from_usize(0))
+    unreachable!();
 }
